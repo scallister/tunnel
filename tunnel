@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+# Private HTTP tunnel client. See README.md for runtime configuration.
+set -euo pipefail
+
+VERSION="0.71.0"
+DOMAIN="${TUNNEL_DOMAIN:-}"
+SERVER="${TUNNEL_SERVER:-}"
+SERVER_PORT="${TUNNEL_SERVER_PORT:-443}"
+PROTOCOL="${TUNNEL_PROTOCOL:-wss}"
+TOKEN="${TUNNEL_TOKEN:-}"
+
+usage() {
+  cat <<EOF
+Usage: tunnel http <port> [name]
+       tunnel http <host>:<port> [name]
+
+Each run gets its own hostname so more than one can stay up.
+
+  tunnel http 8080
+  https://t-<random>.${DOMAIN:-example.com}
+
+  tunnel http 8080 myapp
+  https://t-myapp.${DOMAIN:-example.com}
+
+Required environment: TUNNEL_DOMAIN, TUNNEL_SERVER, TUNNEL_TOKEN.
+Local server must be plain HTTP. The public URL is open; this token
+is only for registering the tunnel.
+EOF
+}
+
+if [[ $# -eq 0 || "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+if [[ "$1" != "http" ]]; then
+  echo "only http is published (got: $1)" >&2
+  usage >&2
+  exit 2
+fi
+shift
+
+if [[ $# -lt 1 || $# -gt 2 ]]; then
+  usage >&2
+  exit 2
+fi
+
+target="${1#http://}"
+if [[ "$target" == https://* ]]; then
+  echo "local server must use plain HTTP" >&2
+  exit 2
+fi
+target="${target%/}"
+
+if [[ "$target" == \[* ]]; then
+  echo "IPv6 targets are not supported; use 127.0.0.1 or a hostname" >&2
+  exit 2
+fi
+
+if [[ "$target" == *:* ]]; then
+  local_host="${target%%:*}"
+  local_port="${target#*:}"
+else
+  local_host="127.0.0.1"
+  local_port="$target"
+fi
+
+if [[ -z "$local_host" || ! "$local_port" =~ ^[0-9]+$ ]] || (( ${#local_port} > 5 || 10#$local_port < 1 || 10#$local_port > 65535 )); then
+  echo "invalid target: $1" >&2
+  exit 2
+fi
+
+local_port=$((10#$local_port))
+if [[ ! "$local_host" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+  echo "invalid local hostname" >&2
+  exit 2
+fi
+
+for setting in TUNNEL_DOMAIN TUNNEL_SERVER TUNNEL_TOKEN; do
+  if [[ -z "${!setting:-}" ]]; then
+    echo "required environment variable is missing: $setting" >&2
+    exit 2
+  fi
+done
+for host in "$DOMAIN" "$SERVER"; do
+  if [[ ! "$host" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]]; then
+    echo "domain and server must be hostnames without a scheme, path, or port" >&2
+    exit 2
+  fi
+done
+if [[ ! "$SERVER_PORT" =~ ^[0-9]{1,5}$ ]] || (( 10#$SERVER_PORT < 1 || 10#$SERVER_PORT > 65535 )); then
+  echo "invalid TUNNEL_SERVER_PORT" >&2
+  exit 2
+fi
+SERVER_PORT=$((10#$SERVER_PORT))
+case "$PROTOCOL" in
+  tcp|kcp|quic|websocket|wss) ;;
+  *) echo "invalid TUNNEL_PROTOCOL" >&2; exit 2 ;;
+esac
+# Escape a TOML basic string without expanding or exposing the credential.
+if [[ "$TOKEN" =~ [[:cntrl:]] ]]; then
+  echo "TUNNEL_TOKEN must not contain control characters" >&2
+  exit 2
+fi
+TOKEN="${TOKEN//\\/\\\\}"
+TOKEN="${TOKEN//\"/\\\"}"
+
+raw_name="${2:-${TUNNEL_NAME:-}}"
+if [[ -z "$raw_name" ]]; then
+  raw_name="t-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
+else
+  raw_name="$(printf '%s' "$raw_name" | tr '[:upper:]' '[:lower:]')"
+  if [[ "$raw_name" != t-* ]]; then
+    raw_name="t-${raw_name}"
+  fi
+fi
+
+if [[ ! "$raw_name" =~ ^t-[a-z0-9]([-a-z0-9]{0,30}[a-z0-9])?$ ]]; then
+  echo "invalid name: ${raw_name} (use letters, digits, hyphens; t- is added)" >&2
+  exit 2
+fi
+
+if [[ "$(uname -s)" != Linux ]]; then
+  echo "this client supports Linux only" >&2
+  exit 1
+fi
+
+case "$(uname -m)" in
+  x86_64|amd64) arch="amd64" ;;
+  aarch64|arm64) arch="arm64" ;;
+  *)
+    echo "unsupported architecture: $(uname -m) (need amd64 or arm64)" >&2
+    exit 1
+    ;;
+esac
+
+declare -A SHA256=(
+  [amd64]="84f27e39f11169f7adcef8e8b70c9329de17747b1f14dad9fb95eef5682ea716"
+  [arm64]="f33c293c275d8fc68c654b6fba8f10b2551d6463d09a9fc9cffb7227eae82266"
+)
+
+bin_dir="${XDG_DATA_HOME:-$HOME/.local/share}/private-tunnel"
+bin="${bin_dir}/frpc-${VERSION}-${arch}"
+mkdir -p "$bin_dir"
+
+if [[ ! -x "$bin" ]]; then
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT
+  archive="${tmp}/frp.tar.gz"
+  url="https://github.com/fatedier/frp/releases/download/v${VERSION}/frp_${VERSION}_linux_${arch}.tar.gz"
+  curl -fsSL "$url" -o "$archive"
+  got="$(sha256sum "$archive" | awk '{print $1}')"
+  if [[ "$got" != "${SHA256[$arch]}" ]]; then
+    echo "checksum mismatch for ${url}" >&2
+    exit 1
+  fi
+  tar -xzf "$archive" -C "$tmp"
+  install -m 0755 "${tmp}/frp_${VERSION}_linux_${arch}/frpc" "$bin"
+  rm -rf "$tmp"
+  trap - EXIT
+fi
+
+public_url="https://${raw_name}.${DOMAIN}"
+cfg="$(mktemp)"
+chmod 600 "$cfg"
+trap 'rm -f "$cfg"' EXIT
+cat > "$cfg" <<EOF
+serverAddr = "${SERVER}"
+serverPort = ${SERVER_PORT}
+auth.method = "token"
+auth.token = "${TOKEN}"
+transport.protocol = "${PROTOCOL}"
+loginFailExit = true
+log.to = "console"
+log.level = "info"
+log.disablePrintColor = true
+
+[[proxies]]
+name = "${raw_name}"
+type = "http"
+localIP = "${local_host}"
+localPort = ${local_port}
+subdomain = "${raw_name}"
+EOF
+
+echo "${public_url} -> http://${local_host}:${local_port}"
+"$bin" -c "$cfg"
