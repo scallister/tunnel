@@ -13,6 +13,9 @@ usage() {
   cat <<EOF
 Usage: tunnel http <port> [name]
        tunnel http <host>:<port> [name]
+       tunnel http <port> [name] --timeout <duration>
+       tunnel tcp <port> [name] [--timeout 30m]
+       tunnel connect <https-url-or-hostname>
 
 Each run gets its own hostname so more than one can stay up.
 
@@ -25,6 +28,11 @@ Each run gets its own hostname so more than one can stay up.
 Required environment: TUNNEL_DOMAIN, TUNNEL_SERVER, TUNNEL_TOKEN.
 Local server must be plain HTTP. The public URL is open; this token
 is only for registering the tunnel.
+
+TCP mode carries a local port over HTTPS/WebSocket and expires after 30 minutes
+by default (maximum 4 hours). It does not add authentication: use it with SSH
+or another authenticated service. Requires Python and websockets>=15,<17.
+HTTP tunnels have no timeout unless supplied. Durations: 30s, 30m, 2h.
 EOF
 }
 
@@ -33,12 +41,37 @@ if [[ $# -eq 0 || "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   exit 0
 fi
 
+if [[ "$1" == "tcp" || "$1" == "connect" ]]; then
+  script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+  exec "${TUNNEL_PYTHON:-python3}" "${script_dir}/tunnel_tcp.py" "$@"
+fi
+
 if [[ "$1" != "http" ]]; then
-  echo "only http is published (got: $1)" >&2
+  echo "unknown command: $1" >&2
   usage >&2
   exit 2
 fi
 shift
+
+timeout_duration=""
+positional=()
+while (( $# )); do
+  if [[ "$1" == "--timeout" ]]; then
+    if [[ -n "$timeout_duration" || $# -lt 2 || ! "$2" =~ ^[1-9][0-9]{0,4}[smh]?$ ]]; then
+      echo "--timeout requires one positive duration, such as 30m" >&2
+      exit 2
+    fi
+    timeout_duration="$2"
+    shift 2
+  elif [[ "$1" == --* ]]; then
+    echo "unknown option: $1" >&2
+    exit 2
+  else
+    positional+=("$1")
+    shift
+  fi
+done
+set -- "${positional[@]}"
 
 if [[ $# -lt 1 || $# -gt 2 ]]; then
   usage >&2
@@ -184,4 +217,9 @@ subdomain = "${raw_name}"
 EOF
 
 echo "${public_url} -> http://${local_host}:${local_port}"
-"$bin" -c "$cfg"
+if [[ -n "$timeout_duration" ]]; then
+  echo "Tunnel expires after ${timeout_duration}"
+  timeout --kill-after=2s "$timeout_duration" "$bin" -c "$cfg"
+else
+  "$bin" -c "$cfg"
+fi

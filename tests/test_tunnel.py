@@ -4,6 +4,7 @@ from pathlib import Path
 import platform
 import subprocess
 import tempfile
+import time
 import unittest
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'tunnel'
@@ -27,6 +28,9 @@ assert stat.S_IMODE(p.stat().st_mode) == 0o600
 config = tomllib.loads(p.read_text())
 pathlib.Path(os.environ['XDG_DATA_HOME'], 'capture.json').write_text(json.dumps(config))
 pathlib.Path(os.environ['XDG_DATA_HOME'], 'config-path').write_text(str(p))
+if os.environ.get('FAKE_SLEEP'):
+    import time
+    time.sleep(float(os.environ['FAKE_SLEEP']))
 sys.exit(int(os.environ.get('FAKE_EXIT', '0')))
 ''')
         client.chmod(0o755)
@@ -69,6 +73,19 @@ sys.exit(int(os.environ.get('FAKE_EXIT', '0')))
         result = self.run_client('http', '8080')
         self.assertEqual(result.returncode, 7)
         self.assertFalse(Path((self.root / 'config-path').read_text()).exists())
+
+    def test_http_timeout_and_cleanup(self):
+        self.env['FAKE_SLEEP'] = '20'
+        started = time.monotonic()
+        result = self.run_client('http', '8080', '--timeout', '1s')
+        self.assertEqual(result.returncode, 124, result.stderr)
+        self.assertLess(time.monotonic() - started, 4)
+        self.assertFalse(Path((self.root / 'config-path').read_text()).exists())
+
+    def test_rejects_invalid_timeouts(self):
+        for value in ('0', '-1', 'forever', '1.5h', '999999999m'):
+            with self.subTest(value=value):
+                self.assertEqual(self.run_client('http', '8080', '--timeout', value).returncode, 2)
 
     def test_rejects_bad_targets(self):
         for target in ('https://localhost:8080', 'host:extra:80', '65536', '0', '[::1]:80'):
